@@ -1,0 +1,8 @@
+[ro.build.version.sdk]: [30]
+[ro.build.version.release]: []
+[ro.product.manufacturer]: []
+[ro.product.model]: []
+[ro.product.cpu.abi]: []
+[ro.config.low_ram]: [sometimes]
+[broken.line
+[ro.product.brand]: [unknown]

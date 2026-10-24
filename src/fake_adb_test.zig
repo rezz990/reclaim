@@ -5,6 +5,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const adb = @import("adb.zig");
+const denylist = @import("denylist.zig");
+const device = @import("device.zig");
 const doctor = @import("doctor.zig");
 const main = @import("main.zig");
 
@@ -354,6 +356,229 @@ test "doctor command exits zero and prints the device" {
     try std.testing.expectEqualStrings("", err.writer.buffered());
 }
 
+const CommandOutput = struct {
+    code: u8,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(output: *const CommandOutput) void {
+        alloc.free(output.stdout);
+        alloc.free(output.stderr);
+    }
+};
+
+fn runWithFake(fake: *const Fake, args: []const []const u8) !CommandOutput {
+    const full = try alloc.alloc([]const u8, args.len + 2);
+    defer alloc.free(full);
+    @memcpy(full[0..args.len], args);
+    full[args.len] = "--adb";
+    full[args.len + 1] = fake.path;
+
+    var env = emptyEnv();
+    defer env.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var err_writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer err_writer.deinit();
+
+    const code = try main.run(arena.allocator(), io, &env, full, &out.writer, &err_writer.writer);
+    const stdout = try out.toOwnedSlice();
+    errdefer alloc.free(stdout);
+    const stderr = try err_writer.toOwnedSlice();
+    return .{ .code = code, .stdout = stdout, .stderr = stderr };
+}
+
+test "probe reads the fingerprint from the fake adb" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+
+    var fingerprint = try device.probe(alloc, fake.handle(), "FAKE123");
+    defer fingerprint.deinit(alloc);
+
+    try std.testing.expectEqualStrings("FAKE123", fingerprint.serial);
+    try std.testing.expectEqual(@as(?u32, 29), fingerprint.sdk);
+    try std.testing.expectEqualStrings("10", fingerprint.release.?);
+    try std.testing.expectEqualStrings("Xiaomi", fingerprint.manufacturer.?);
+    try std.testing.expectEqualStrings("Redmi Note 5", fingerprint.model.?);
+    try std.testing.expectEqualStrings("arm64-v8a", fingerprint.abi.?);
+    try std.testing.expectEqual(@as(?bool, false), fingerprint.low_ram);
+    try std.testing.expectEqual(@as(?u64, 2947), fingerprint.ram_total_mb);
+}
+
+test "probe fails when the device cannot be queried" {
+    var fake = try Fake.scenario("unauthorized");
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.AdbFailed,
+        device.probe(alloc, fake.handle(), "FAKE123"),
+    );
+}
+
+test "scan prints the device info and a light recommendation" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "device: FAKE123\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "model: Redmi Note 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: 10 (SDK 29)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: 2947 MB\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "recommendation: light") != null);
+}
+
+test "scan emits the fingerprint and recommendation as JSON" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "--json" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"device\":{"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"model\":\"Redmi Note 5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"ram_total_mb\":2947") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\":\"light\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "scan recommends balanced for a mid-range device" {
+    var fake = try Fake.scenario("ok");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.stdout, "recommendation: balanced (RAM 3800 MB <= 4096 MB)") != null,
+    );
+}
+
+test "scan leaves a high-end device alone" {
+    var fake = try Fake.scenario("scan_roomy");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "--json" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":34") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"ram_total_mb\":7910") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\":null") != null);
+}
+
+test "scan tolerates missing device fields" {
+    var fake = try Fake.scenario("scan_partial");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "--json" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("", output.stderr);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"release\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"model\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"low_ram\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"ram_total_mb\":2947") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\":\"light\"") != null);
+}
+
+test "scan reports an unknown recommendation without RAM" {
+    var fake = try Fake.scenario("scan_no_ram");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "ram: unknown") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.stdout, "recommendation: none (RAM total is unavailable)") != null,
+    );
+}
+
+test "scan refuses multiple devices without a serial" {
+    var fake = try Fake.scenario("multi");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "multiple devices connected") != null);
+}
+
+test "scan accepts an explicit serial when several devices are attached" {
+    var fake = try Fake.scenario("multi");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "-s", "FAKE123" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stdout, "device: FAKE123") != null);
+}
+
+test "scan refuses an offline selected device" {
+    var fake = try Fake.scenario("multi");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "-s", "FAKE456" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "device 'FAKE456' is offline") != null);
+}
+
+test "scan refuses an unauthorized device" {
+    var fake = try Fake.scenario("unauthorized");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "is unauthorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "USB debugging prompt") != null);
+}
+
+test "scan reports when no device is attached" {
+    var fake = try Fake.scenario("none");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{"scan"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "no device connected") != null);
+}
+
+test "scan reports a serial that does not exist" {
+    var fake = try Fake.scenario("multi");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "scan", "-s", "NOPE" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "device 'NOPE' not found") != null);
+}
+
 test "doctor command can emit JSON" {
     var fake = try Fake.scenario("ok");
     defer fake.deinit();
@@ -380,4 +605,155 @@ test "doctor command can emit JSON" {
     const text = out.writer.buffered();
     try std.testing.expect(std.mem.startsWith(u8, text, "{\"adb\":{"));
     try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"device\"") != null);
+}
+
+test "plan light prints the diff for a matching device" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "light" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("", output.stderr);
+
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "profile: light\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "device: FAKE123\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: SDK 29\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: 2947 MB\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "steps: 5 (apply 5, skip 0, blocked 0)\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "global/window_animation_scale  1.0 -> 0.5  [safe]") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "global/transition_animation_scale  0.5 -> 0.5  (unchanged)") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "global/animator_duration_scale  (unset) -> 0.5") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "compile speed-profile (all)  (not tracked)") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "idle maintenance  (not tracked)") != null);
+}
+
+test "plan light can emit JSON" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "light", "--json" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        text,
+        "{\"profile\":\"light\",\"device\":\"FAKE123\",\"sdk\":29,\"ram_total_mb\":2947",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"id\":\"anim-window\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"current\":{\"state\":\"value\",\"value\":\"1.0\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"current\":{\"state\":\"unset\",\"value\":null}") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"summary\":{\"apply\":5,\"skip\":0,\"blocked\":0}") != null,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "plan balanced applies the phantom steps on a supported device" {
+    var fake = try Fake.scenario("plan_balanced");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "balanced" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "profile: balanced\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: SDK 33\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: 3808 MB\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "steps: 7 (apply 7, skip 0, blocked 0)\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            text,
+            "activity_manager/max_phantom_processes  32 -> 2147483647  [caution]",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            text,
+            "global/settings_enable_monitor_phantom_procs  true -> false  [caution]",
+        ) != null,
+    );
+}
+
+test "plan skips every step when the device is outside the profile limits" {
+    var fake = try Fake.scenario("scan_roomy");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "light" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "steps: 5 (apply 0, skip 5, blocked 0)\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "profile requires RAM <= 3072 MB (device has 7910 MB)") != null,
+    );
+}
+
+test "plan reports a missing profile before touching adb" {
+    var fake = try Fake.scenario("ok");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "missing-profile" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 1), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.stderr, "profile 'missing-profile' was not found") != null,
+    );
+}
+
+test "plan refuses multiple devices without a serial" {
+    var fake = try Fake.scenario("multi");
+    defer fake.deinit();
+
+    const output = try runWithFake(&fake, &.{ "plan", "light" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 4), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "multiple devices connected") != null);
+}
+
+test "denylist reads the default apps from the device" {
+    var fake = try Fake.scenario("deny");
+    defer fake.deinit();
+
+    var dynamic = try denylist.readDynamic(alloc, fake.handle(), "FAKE123");
+    defer dynamic.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 4), dynamic.entries.len);
+    try std.testing.expectEqual(denylist.Role.launcher, dynamic.roleOf("com.example.launcher").?);
+    try std.testing.expectEqual(denylist.Role.keyboard, dynamic.roleOf("com.example.keyboard").?);
+    try std.testing.expectEqual(denylist.Role.dialer, dynamic.roleOf("com.example.dialer").?);
+    try std.testing.expectEqual(denylist.Role.sms, dynamic.roleOf("com.example.sms").?);
+}
+
+test "denylist fails closed when a device query fails" {
+    var fake = try Fake.scenario("deny_fail");
+    defer fake.deinit();
+
+    try std.testing.expectError(
+        error.AdbFailed,
+        denylist.readDynamic(alloc, fake.handle(), "FAKE123"),
+    );
 }

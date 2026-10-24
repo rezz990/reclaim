@@ -1,7 +1,9 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const adb = @import("adb.zig");
+const device = @import("device.zig");
 const doctor = @import("doctor.zig");
+const plan = @import("plan.zig");
 
 const Writer = std.Io.Writer;
 const Allocator = std.mem.Allocator;
@@ -137,6 +139,266 @@ const DoctorJson = struct {
     server: ServerJson,
     devices: []const DeviceJson,
     devices_error: ?[]const u8 = null,
+};
+
+pub fn printError(writer: *Writer, message: []const u8) Writer.Error!void {
+    try writer.print("reclaim: {s}\n", .{message});
+}
+
+pub fn printScan(
+    writer: *Writer,
+    fingerprint: device.Fingerprint,
+    recommendation: device.Recommendation,
+) Writer.Error!void {
+    try writer.print("device: {s}\n", .{fingerprint.serial});
+    try writer.print("model: {s}\n", .{fingerprint.model orelse "unknown"});
+    try writer.print("manufacturer: {s}\n", .{fingerprint.manufacturer orelse "unknown"});
+    try printAndroid(writer, fingerprint.release, fingerprint.sdk);
+    try writer.print("abi: {s}\n", .{fingerprint.abi orelse "unknown"});
+    if (fingerprint.ram_total_mb) |ram| {
+        try writer.print("ram: {d} MB\n", .{ram});
+    } else {
+        try writer.writeAll("ram: unknown\n");
+    }
+    if (fingerprint.low_ram) |low| {
+        try writer.print("low ram: {s}\n", .{if (low) "true" else "false"});
+    } else {
+        try writer.writeAll("low ram: unknown\n");
+    }
+
+    const profile = if (recommendation.profile) |value| value.label() else "none";
+    try writer.print("recommendation: {s} ({s})\n", .{ profile, recommendation.reason });
+}
+
+pub fn printScanJson(
+    writer: *Writer,
+    fingerprint: device.Fingerprint,
+    recommendation: device.Recommendation,
+) Writer.Error!void {
+    const view: ScanJson = .{
+        .device = .{
+            .serial = fingerprint.serial,
+            .sdk = fingerprint.sdk,
+            .release = fingerprint.release,
+            .manufacturer = fingerprint.manufacturer,
+            .model = fingerprint.model,
+            .abi = fingerprint.abi,
+            .low_ram = fingerprint.low_ram,
+            .ram_total_mb = fingerprint.ram_total_mb,
+        },
+        .recommendation = .{
+            .profile = if (recommendation.profile) |value| value.label() else null,
+            .reason = recommendation.reason,
+        },
+    };
+    try std.json.Stringify.value(view, .{}, writer);
+    try writer.writeAll("\n");
+}
+
+pub fn printSelectionError(
+    writer: *Writer,
+    failure: device.SelectionError,
+    requested_serial: ?[]const u8,
+    entries: []const adb.DeviceEntry,
+) Writer.Error!void {
+    switch (failure) {
+        error.NoDevices => try writer.writeAll(
+            "reclaim: no device connected; connect a device over USB and enable USB debugging\n",
+        ),
+        error.MultipleDevices => try writer.writeAll(
+            "reclaim: multiple devices connected; choose one with -s <serial>\n",
+        ),
+        error.SerialNotFound => try writer.print(
+            "reclaim: device '{s}' not found; run 'reclaim doctor' to list devices\n",
+            .{requested_serial orelse ""},
+        ),
+        error.DeviceNotReady => {
+            const entry = selectedEntry(entries, requested_serial) orelse {
+                try writer.writeAll("reclaim: the selected device is not ready\n");
+                return;
+            };
+            try writer.print(
+                "reclaim: device '{s}' is {s}; {s}\n",
+                .{ entry.serial, entry.state.label(), scanStateHint(entry.state) },
+            );
+        },
+    }
+}
+
+fn printAndroid(writer: *Writer, release: ?[]const u8, sdk: ?u32) Writer.Error!void {
+    if (release) |value| {
+        if (sdk) |level| {
+            try writer.print("android: {s} (SDK {d})\n", .{ value, level });
+        } else {
+            try writer.print("android: {s}\n", .{value});
+        }
+        return;
+    }
+    if (sdk) |level| {
+        try writer.print("android: SDK {d}\n", .{level});
+        return;
+    }
+    try writer.writeAll("android: unknown\n");
+}
+
+fn selectedEntry(entries: []const adb.DeviceEntry, serial: ?[]const u8) ?adb.DeviceEntry {
+    if (serial) |wanted| {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.serial, wanted)) return entry;
+        }
+        return null;
+    }
+    return if (entries.len == 1) entries[0] else null;
+}
+
+fn scanStateHint(state: adb.DeviceState) []const u8 {
+    return switch (state) {
+        .device => "the device is ready",
+        .unauthorized => "accept the USB debugging prompt on the device, then run scan again",
+        .offline => "reconnect the device or restart the adb server",
+        .no_permissions => "fix USB permissions: add your user to the plugdev group on Linux, or install the OEM USB driver on Windows",
+        .unknown => "unexpected device state; reconnect the device",
+    };
+}
+
+const ScanJson = struct {
+    device: ScanDeviceJson,
+    recommendation: ScanRecommendationJson,
+};
+
+const ScanDeviceJson = struct {
+    serial: []const u8,
+    sdk: ?u32 = null,
+    release: ?[]const u8 = null,
+    manufacturer: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    abi: ?[]const u8 = null,
+    low_ram: ?bool = null,
+    ram_total_mb: ?u64 = null,
+};
+
+const ScanRecommendationJson = struct {
+    profile: ?[]const u8 = null,
+    reason: []const u8,
+};
+
+pub fn printPlan(writer: *Writer, plan_value: plan.Plan) Writer.Error!void {
+    try writer.print("profile: {s}\n", .{plan_value.profile});
+    try writer.print("device: {s}\n", .{plan_value.serial});
+    if (plan_value.sdk) |sdk| {
+        try writer.print("android: SDK {d}\n", .{sdk});
+    } else {
+        try writer.writeAll("android: unknown\n");
+    }
+    if (plan_value.ram_total_mb) |ram| {
+        try writer.print("ram: {d} MB\n", .{ram});
+    } else {
+        try writer.writeAll("ram: unknown\n");
+    }
+    try writer.print(
+        "steps: {d} (apply {d}, skip {d}, blocked {d})\n\n",
+        .{
+            plan_value.steps.len,
+            plan_value.count(.apply),
+            plan_value.count(.skip),
+            plan_value.count(.blocked),
+        },
+    );
+
+    for (plan_value.steps) |step| {
+        try writer.print("  {s:<7} {s:<16} {s}", .{
+            step.status.label(),
+            step.id,
+            step.target,
+        });
+        if (step.desired) |desired| {
+            try writer.print("  {s} -> {s}", .{ step.current.describe(), desired });
+        } else {
+            try writer.print("  {s}", .{step.current.describe()});
+        }
+        if (!step.changed and step.status == .apply) try writer.writeAll("  (unchanged)");
+        try writer.print("  [{s}]", .{step.risk.label()});
+        if (step.reason) |reason| try writer.print("  ({s})", .{reason});
+        try writer.writeAll("\n");
+    }
+
+    if (plan_value.count(.blocked) > 0) {
+        try writer.writeAll(
+            "\nblocked steps touch protected packages and are never applied.\n",
+        );
+    }
+}
+
+pub fn printPlanJson(
+    alloc: Allocator,
+    writer: *Writer,
+    plan_value: plan.Plan,
+) (Allocator.Error || Writer.Error)!void {
+    const steps = try alloc.alloc(PlanStepJson, plan_value.steps.len);
+    defer alloc.free(steps);
+    for (plan_value.steps, 0..) |step, index| {
+        steps[index] = .{
+            .id = step.id,
+            .kind = step.kind.label(),
+            .risk = step.risk.label(),
+            .target = step.target,
+            .current = .{
+                .state = step.current.state.label(),
+                .value = step.current.value,
+            },
+            .desired = step.desired,
+            .status = step.status.label(),
+            .changed = step.changed,
+            .reason = step.reason,
+        };
+    }
+
+    const view: PlanJson = .{
+        .profile = plan_value.profile,
+        .device = plan_value.serial,
+        .sdk = plan_value.sdk,
+        .ram_total_mb = plan_value.ram_total_mb,
+        .steps = steps,
+        .summary = .{
+            .apply = plan_value.count(.apply),
+            .skip = plan_value.count(.skip),
+            .blocked = plan_value.count(.blocked),
+        },
+    };
+    try std.json.Stringify.value(view, .{}, writer);
+    try writer.writeAll("\n");
+}
+
+const PlanJson = struct {
+    profile: []const u8,
+    device: []const u8,
+    sdk: ?u32 = null,
+    ram_total_mb: ?u64 = null,
+    steps: []const PlanStepJson,
+    summary: PlanSummaryJson,
+};
+
+const PlanStepJson = struct {
+    id: []const u8,
+    kind: []const u8,
+    risk: []const u8,
+    target: []const u8,
+    current: PlanCurrentJson,
+    desired: ?[]const u8 = null,
+    status: []const u8,
+    changed: bool,
+    reason: ?[]const u8 = null,
+};
+
+const PlanCurrentJson = struct {
+    state: []const u8,
+    value: ?[]const u8 = null,
+};
+
+const PlanSummaryJson = struct {
+    apply: usize,
+    skip: usize,
+    blocked: usize,
 };
 
 const Render = struct {
@@ -275,6 +537,313 @@ test "doctor JSON is machine readable" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"unauthorized\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"serial\":\"FAKE123\"") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "scan report shows the fingerprint and recommendation" {
+    const fingerprint: device.Fingerprint = .{
+        .serial = "FAKE123",
+        .sdk = 29,
+        .release = "10",
+        .manufacturer = "Xiaomi",
+        .model = "Redmi Note 5",
+        .abi = "arm64-v8a",
+        .low_ram = false,
+        .ram_total_mb = 2947,
+    };
+    const recommendation: device.Recommendation = .{
+        .profile = .light,
+        .reason = "RAM 2947 MB <= 3072 MB and SDK 29 < 31",
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printScan(render.writer(), fingerprint, recommendation);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "device: FAKE123\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "model: Redmi Note 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "manufacturer: Xiaomi\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: 10 (SDK 29)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "abi: arm64-v8a\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: 2947 MB\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "low ram: false\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "recommendation: light (RAM 2947 MB <= 3072 MB and SDK 29 < 31)\n") != null,
+    );
+}
+
+test "scan report marks missing fields as unknown" {
+    const fingerprint: device.Fingerprint = .{ .serial = "EMPTY" };
+    const recommendation: device.Recommendation = .{ .reason = "RAM total is unavailable" };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printScan(render.writer(), fingerprint, recommendation);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "model: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "manufacturer: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "abi: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "low ram: unknown\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "recommendation: none (RAM total is unavailable)\n") != null,
+    );
+}
+
+test "scan report prints partial Android versions" {
+    var render: Render = .init();
+    defer render.deinit();
+    const recommendation: device.Recommendation = .{ .reason = "none" };
+
+    try printScan(render.writer(), .{ .serial = "A", .sdk = 30 }, recommendation);
+    try std.testing.expect(std.mem.indexOf(u8, render.output(), "android: SDK 30\n") != null);
+
+    try printScan(render.writer(), .{ .serial = "B", .release = "11" }, recommendation);
+    try std.testing.expect(std.mem.indexOf(u8, render.output(), "android: 11\n") != null);
+}
+
+test "scan JSON is machine readable" {
+    const fingerprint: device.Fingerprint = .{
+        .serial = "FAKE123",
+        .sdk = 29,
+        .release = "10",
+        .manufacturer = "Xiaomi",
+        .model = "Redmi Note 5",
+        .abi = "arm64-v8a",
+        .low_ram = false,
+        .ram_total_mb = 2947,
+    };
+    const recommendation: device.Recommendation = .{
+        .profile = .light,
+        .reason = "RAM 2947 MB <= 3072 MB and SDK 29 < 31",
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printScanJson(render.writer(), fingerprint, recommendation);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"device\":{"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"serial\":\"FAKE123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"low_ram\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"ram_total_mb\":2947") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\":\"light\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "scan JSON emits null for missing fields" {
+    const fingerprint: device.Fingerprint = .{ .serial = "EMPTY" };
+    const recommendation: device.Recommendation = .{ .reason = "RAM total is unavailable" };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printScanJson(render.writer(), fingerprint, recommendation);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"model\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\":null") != null);
+}
+
+test "plan report shows status, diffs, risk, and reasons" {
+    var steps = [_]plan.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .desired = "0.5",
+            .current = .{ .state = .value, .value = "1.0" },
+        },
+        .{
+            .id = "transition",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/transition_animation_scale",
+            .desired = "0.5",
+            .current = .{ .state = .value, .value = "0.5" },
+            .changed = false,
+        },
+        .{
+            .id = "idle-maint",
+            .kind = .maintenance,
+            .risk = .safe,
+            .target = "idle maintenance",
+            .current = .{ .state = .not_tracked },
+        },
+        .{
+            .id = "dexopt",
+            .kind = .compile,
+            .risk = .safe,
+            .target = "compile speed-profile (all)",
+            .current = .{ .state = .not_tracked },
+            .status = .skip,
+            .reason = "requires SDK >= 30 (device is 29)",
+        },
+        .{
+            .id = "disable-pkg",
+            .kind = .package,
+            .risk = .caution,
+            .target = "com.example.app",
+            .desired = "disable",
+            .current = .{ .state = .not_tracked },
+            .status = .blocked,
+            .reason = "package 'com.example.app' is the default launcher",
+        },
+    };
+    const plan_value: plan.Plan = .{
+        .profile = "light",
+        .serial = "FAKE123",
+        .sdk = 29,
+        .ram_total_mb = 2947,
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printPlan(render.writer(), plan_value);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "profile: light\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "device: FAKE123\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: SDK 29\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: 2947 MB\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "steps: 5 (apply 3, skip 1, blocked 1)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "global/window_animation_scale  1.0 -> 0.5  [safe]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(unchanged)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "idle maintenance  (not tracked)  [safe]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(requires SDK >= 30 (device is 29))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocked steps touch protected packages") != null);
+}
+
+test "plan report marks unknown device data" {
+    var steps = [_]plan.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .desired = "0.5",
+            .current = .{ .state = .unset },
+            .reason = "profile requires RAM <= 3072 MB, but the RAM total is unknown",
+            .status = .skip,
+        },
+    };
+    const plan_value: plan.Plan = .{
+        .profile = "light",
+        .serial = "EMPTY",
+        .sdk = null,
+        .ram_total_mb = null,
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printPlan(render.writer(), plan_value);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "android: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ram: unknown\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(unset) -> 0.5") != null);
+}
+
+test "plan JSON is machine readable" {
+    var steps = [_]plan.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .desired = "0.5",
+            .current = .{ .state = .value, .value = "1.0" },
+        },
+        .{
+            .id = "idle-maint",
+            .kind = .maintenance,
+            .risk = .safe,
+            .target = "idle maintenance",
+            .current = .{ .state = .not_tracked },
+        },
+        .{
+            .id = "disable-pkg",
+            .kind = .package,
+            .risk = .caution,
+            .target = "com.example.app",
+            .desired = "disable",
+            .current = .{ .state = .not_tracked },
+            .status = .blocked,
+            .reason = "package 'com.example.app' is the default launcher",
+        },
+    };
+    const plan_value: plan.Plan = .{
+        .profile = "light",
+        .serial = "FAKE123",
+        .sdk = 29,
+        .ram_total_mb = 2947,
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printPlanJson(std.testing.allocator, render.writer(), plan_value);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"profile\":\"light\",\"device\":\"FAKE123\""));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"sdk\":29") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"state\":\"value\",\"value\":\"1.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"desired\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"status\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"reason\":null") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"summary\":{\"apply\":2,\"skip\":0,\"blocked\":1}") != null,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "scan selection errors explain missing and multiple devices" {
+    var missing: Render = .init();
+    defer missing.deinit();
+    try printSelectionError(missing.writer(), error.NoDevices, null, &.{});
+    try std.testing.expect(
+        std.mem.indexOf(u8, missing.output(), "no device connected") != null,
+    );
+
+    var multiple: Render = .init();
+    defer multiple.deinit();
+    try printSelectionError(multiple.writer(), error.MultipleDevices, null, &.{});
+    try std.testing.expect(
+        std.mem.indexOf(u8, multiple.output(), "multiple devices connected; choose one with -s") != null,
+    );
+}
+
+test "scan selection errors name the serial and its state" {
+    const entries = [_]adb.DeviceEntry{
+        .{ .serial = "FAKE123", .state = .unauthorized, .detail = "unauthorized" },
+    };
+
+    var not_ready: Render = .init();
+    defer not_ready.deinit();
+    try printSelectionError(not_ready.writer(), error.DeviceNotReady, "FAKE123", &entries);
+    const text = not_ready.output();
+    try std.testing.expect(std.mem.indexOf(u8, text, "device 'FAKE123' is unauthorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "accept the USB debugging prompt") != null);
+
+    var not_found: Render = .init();
+    defer not_found.deinit();
+    try printSelectionError(not_found.writer(), error.SerialNotFound, "NOPE", &entries);
+    try std.testing.expect(
+        std.mem.indexOf(u8, not_found.output(), "device 'NOPE' not found") != null,
+    );
+}
+
+test "printError prefixes the message" {
+    var render: Render = .init();
+    defer render.deinit();
+    try printError(render.writer(), "could not list devices");
+    try std.testing.expectEqualStrings("reclaim: could not list devices\n", render.output());
 }
 
 test "usage errors explain the failure" {

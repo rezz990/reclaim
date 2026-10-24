@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "name": "balanced",
+  "description": "Safe tweaks plus phantom process limits for phones with at most 4 GB of RAM",
+  "requires": { "min_sdk": 21, "max_ram_mb": 4096 },
+  "steps": [
+    {
+      "id": "anim-window",
+      "kind": "setting",
+      "namespace": "global",
+      "key": "window_animation_scale",
+      "value": "0.5",
+      "risk": "safe",
+      "min_sdk": 17
+    },
+    {
+      "id": "anim-transition",
+      "kind": "setting",
+      "namespace": "global",
+      "key": "transition_animation_scale",
+      "value": "0.5",
+      "risk": "safe",
+      "min_sdk": 17
+    },
+    {
+      "id": "anim-animator",
+      "kind": "setting",
+      "namespace": "global",
+      "key": "animator_duration_scale",
+      "value": "0.5",
+      "risk": "safe",
+      "min_sdk": 17
+    },
+    {
+      "id": "dexopt",
+      "kind": "compile",
+      "mode": "speed-profile",
+      "scope": "all",
+      "risk": "safe",
+      "min_sdk": 24
+    },
+    {
+      "id": "idle-maint",
+      "kind": "maintenance",
+      "risk": "safe",
+      "min_sdk": 23
+    },
+    {
+      "id": "phantom",
+      "kind": "device_config",
+      "namespace": "activity_manager",
+      "key": "max_phantom_processes",
+      "value": "2147483647",
+      "risk": "caution",
+      "min_sdk": 31
+    },
+    {
+      "id": "phantom-monitor",
+      "kind": "setting",
+      "namespace": "global",
+      "key": "settings_enable_monitor_phantom_procs",
+      "value": "false",
+      "risk": "caution",
+      "min_sdk": 31
+    }
+  ]
+}
