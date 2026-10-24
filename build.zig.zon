@@ -1,0 +1,13 @@
+.{
+    .name = .reclaim,
+    .version = "0.1.0",
+    .fingerprint = 0xdfe9a9afe2d8cf4f,
+    .minimum_zig_version = "0.17.0-dev.2127+e90365cd5",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
