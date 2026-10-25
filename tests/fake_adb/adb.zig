@@ -177,66 +177,31 @@ pub fn main(init: std.process.Init) !u8 {
             try err.writeAll("error: failed to copy the script to the device\n");
             return 1;
         }
+        const push_args = rest[command_index + 1 ..];
+        if (push_args.len >= 2) {
+            try storeScript(
+                arena,
+                init.io,
+                self_path,
+                push_args[push_args.len - 2],
+                push_args[push_args.len - 1],
+            );
+        }
         return 0;
     }
     if (std.mem.eql(u8, command, "shell")) {
-        const shell_args = rest[command_index + 1 ..];
-        const joined = try std.mem.join(arena, " ", shell_args);
-        const shell_command = if (std.mem.endsWith(u8, joined, exit_marker))
-            joined[0 .. joined.len - exit_marker.len]
-        else
-            joined;
-
         if (std.mem.eql(u8, scenario, "unauthorized")) {
             try err.writeAll("error: device unauthorized\n");
             return 1;
         }
-        if (std.mem.eql(u8, shell_command, "getprop")) {
-            try out.writeAll(getpropFor(scenario));
-            try out.writeAll("__RC=0\n");
-        } else if (std.mem.eql(u8, shell_command, "cat /proc/meminfo")) {
-            try out.writeAll(meminfoFor(scenario));
-            try out.writeAll("__RC=0\n");
-        } else if (std.mem.startsWith(u8, shell_command, "settings get ")) {
-            const query = shell_command["settings get ".len..];
-            if (std.mem.eql(u8, scenario, "deny_fail") and
-                std.mem.eql(u8, query, "secure default_input_method"))
-            {
-                try out.writeAll("__RC=1\n");
-            } else {
-                try out.print("{s}\n__RC=0\n", .{settingValue(scenario, query)});
-            }
-        } else if (std.mem.startsWith(u8, shell_command, "device_config get ")) {
-            const query = shell_command["device_config get ".len..];
-            try out.print("{s}\n__RC=0\n", .{deviceConfigValue(scenario, query)});
-        } else if (std.mem.startsWith(u8, shell_command, "cmd package resolve-activity")) {
-            if (std.mem.eql(u8, scenario, "deny")) {
-                if (std.mem.indexOf(u8, shell_command, "android.intent.category.HOME") != null) {
-                    try out.writeAll("priority=0\n");
-                    try out.writeAll(deny_components.launcher);
-                } else if (std.mem.indexOf(u8, shell_command, "android.intent.action.DIAL") != null) {
-                    try out.writeAll(deny_components.dialer);
-                } else {
-                    try out.writeAll(deny_components.sms);
-                }
-                try out.writeAll("\n__RC=0\n");
-            } else if (std.mem.eql(u8, scenario, "resolve_fail")) {
-                try out.writeAll("__RC=1\n");
-            } else {
-                try out.writeAll("__RC=0\n");
-            }
-        } else if (std.mem.startsWith(u8, shell_command, "sh ")) {
-            try out.writeAll("__STEP=anim-window __RC=0\n");
-            try out.writeAll("__STEP=dexopt __RC=1\n");
-            try out.writeAll("__RC=0\n");
-        } else if (std.mem.startsWith(u8, shell_command, "false")) {
-            try out.writeAll("__RC=1\n");
-        } else if (std.mem.startsWith(u8, shell_command, "echo ")) {
-            try out.print("{s}\n__RC=0\n", .{shell_command["echo ".len..]});
-        } else {
-            try out.writeAll("__RC=0\n");
-        }
-        return 0;
+        return runShell(
+            arena,
+            init.io,
+            scenario,
+            self_path,
+            rest[command_index + 1 ..],
+            out,
+        );
     }
     if (std.mem.eql(u8, command, "exit-7")) {
         try err.writeAll("boom\n");
@@ -245,6 +210,448 @@ pub fn main(init: std.process.Init) !u8 {
 
     try err.print("fake adb: unknown command '{s}'\n", .{command});
     return 1;
+}
+
+const max_state_bytes = 1 << 20;
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn runShell(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    scenario: []const u8,
+    self_path: []const u8,
+    args: []const []const u8,
+    out: *std.Io.Writer,
+) !u8 {
+    if (args.len == 2 and eql(args[0], "sh")) {
+        return runStoredScript(alloc, io, scenario, self_path, args[1], out);
+    }
+    if (args.len >= 3 and eql(args[0], "rm") and eql(args[1], "-f")) {
+        const path = try scriptPath(alloc, self_path, args[2]);
+        defer alloc.free(path);
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        return 0;
+    }
+
+    const joined = try std.mem.join(alloc, " ", args);
+    defer alloc.free(joined);
+    const marked = std.mem.endsWith(u8, joined, exit_marker);
+    const command = if (marked) joined[0 .. joined.len - exit_marker.len] else joined;
+
+    const rc = try runDeviceCommand(alloc, io, scenario, self_path, command, out);
+    if (marked) try out.print("__RC={d}\n", .{rc});
+    return 0;
+}
+
+fn runStoredScript(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    scenario: []const u8,
+    self_path: []const u8,
+    remote: []const u8,
+    out: *std.Io.Writer,
+) !u8 {
+    const path = try scriptPath(alloc, self_path, remote);
+    defer alloc.free(path);
+
+    const script = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_state_bytes)) catch {
+        try out.writeAll("__RC=1\n");
+        return 0;
+    };
+    defer alloc.free(script);
+
+    var rc: u8 = 0;
+    var lines = std.mem.splitScalar(u8, script, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "echo \"__STEP=")) {
+            const rest_line = line["echo \"__STEP=".len..];
+            const id_end = std.mem.indexOf(u8, rest_line, " __RC=") orelse rest_line.len;
+            try out.print("__STEP={s} __RC={d}\n", .{ rest_line[0..id_end], rc });
+            rc = 0;
+            continue;
+        }
+        rc = try runDeviceCommand(alloc, io, scenario, self_path, line, out);
+    }
+    try out.print("__RC={d}\n", .{rc});
+    return 0;
+}
+
+fn runDeviceCommand(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    scenario: []const u8,
+    self_path: []const u8,
+    command: []const u8,
+    out: *std.Io.Writer,
+) !u8 {
+    const tokens = try tokenize(alloc, command);
+    if (tokens.len == 0) return 0;
+
+    if (eql(tokens[0], "getprop")) {
+        try out.writeAll(getpropFor(scenario));
+        return 0;
+    }
+    if (eql(tokens[0], "cat") and tokens.len >= 2 and eql(tokens[1], "/proc/meminfo")) {
+        try out.writeAll(meminfoFor(scenario));
+        return 0;
+    }
+
+    if (eql(tokens[0], "settings") and tokens.len >= 4) {
+        const state_path = try statePath(alloc, self_path);
+        defer alloc.free(state_path);
+        if (eql(tokens[1], "get")) {
+            if (eql(scenario, "deny_fail") and
+                eql(tokens[2], "secure") and eql(tokens[3], "default_input_method"))
+            {
+                return 1;
+            }
+            try printSetting(alloc, io, state_path, "setting", scenario, tokens[2], tokens[3], out);
+            return 0;
+        }
+        if (eql(tokens[1], "put") and tokens.len >= 5) {
+            if (mutationFails(scenario)) return 1;
+            if (eql(scenario, "apply_liar")) return 0;
+            try rewriteState(alloc, io, state_path, &.{ "setting", tokens[2], tokens[3] }, tokens[4]);
+            return 0;
+        }
+        if (eql(tokens[1], "delete")) {
+            if (mutationFails(scenario)) return 1;
+            try rewriteState(alloc, io, state_path, &.{ "setting", tokens[2], tokens[3] }, null);
+            return 0;
+        }
+    }
+
+    if (eql(tokens[0], "device_config") and tokens.len >= 4) {
+        const state_path = try statePath(alloc, self_path);
+        defer alloc.free(state_path);
+        if (eql(tokens[1], "get")) {
+            const stored = try getStateValue(
+                alloc,
+                io,
+                state_path,
+                &.{ "device_config", tokens[2], tokens[3] },
+            );
+            if (stored) |value| {
+                defer alloc.free(value);
+                try out.print("{s}\n", .{value});
+            } else {
+                const query = try std.mem.join(alloc, " ", &.{ tokens[2], tokens[3] });
+                defer alloc.free(query);
+                try out.print("{s}\n", .{deviceConfigValue(scenario, query)});
+            }
+            return 0;
+        }
+        if (eql(tokens[1], "put") and tokens.len >= 5) {
+            if (mutationFails(scenario)) return 1;
+            try rewriteState(
+                alloc,
+                io,
+                state_path,
+                &.{ "device_config", tokens[2], tokens[3] },
+                tokens[4],
+            );
+            return 0;
+        }
+        if (eql(tokens[1], "delete")) {
+            if (mutationFails(scenario)) return 1;
+            try rewriteState(alloc, io, state_path, &.{ "device_config", tokens[2], tokens[3] }, null);
+            return 0;
+        }
+    }
+
+    if (eql(tokens[0], "cmd") and tokens.len >= 3) {
+        if (eql(tokens[1], "package") and eql(tokens[2], "resolve-activity")) {
+            if (eql(scenario, "deny")) {
+                if (std.mem.indexOf(u8, command, "android.intent.category.HOME") != null) {
+                    try out.writeAll("priority=0\n");
+                    try out.writeAll(deny_components.launcher);
+                } else if (std.mem.indexOf(u8, command, "android.intent.action.DIAL") != null) {
+                    try out.writeAll(deny_components.dialer);
+                } else {
+                    try out.writeAll(deny_components.sms);
+                }
+                try out.writeAll("\n");
+            } else if (eql(scenario, "resolve_fail")) {
+                return 1;
+            }
+            return 0;
+        }
+        if (eql(tokens[1], "package") and eql(tokens[2], "compile")) {
+            if (mutationFails(scenario)) return 1;
+            if (eql(scenario, "apply_fail") and std.mem.indexOf(u8, command, "--reset") == null) {
+                return 1;
+            }
+            return 0;
+        }
+        if (eql(tokens[1], "package") and eql(tokens[2], "install-existing") and tokens.len >= 4) {
+            if (mutationFails(scenario)) return 1;
+            const state_path = try statePath(alloc, self_path);
+            defer alloc.free(state_path);
+            try rewriteState(alloc, io, state_path, &.{ "package", tokens[3] }, "installed");
+            return 0;
+        }
+        if (eql(tokens[1], "appops") and eql(tokens[2], "set") and tokens.len >= 6) {
+            if (mutationFails(scenario)) return 1;
+            const state_path = try statePath(alloc, self_path);
+            defer alloc.free(state_path);
+            try rewriteState(alloc, io, state_path, &.{ "appops", tokens[3], tokens[4] }, tokens[5]);
+            return 0;
+        }
+        return 0;
+    }
+
+    if (eql(tokens[0], "pm") and tokens.len >= 2) {
+        if (eql(tokens[1], "list")) return 0;
+        if (eql(tokens[1], "disable-user") or eql(tokens[1], "enable") or eql(tokens[1], "uninstall")) {
+            if (mutationFails(scenario)) return 1;
+            const state_path = try statePath(alloc, self_path);
+            defer alloc.free(state_path);
+            const value = if (eql(tokens[1], "disable-user"))
+                "disabled"
+            else if (eql(tokens[1], "enable"))
+                "enabled"
+            else
+                "uninstalled";
+            try rewriteState(alloc, io, state_path, &.{ "package", tokens[tokens.len - 1] }, value);
+            return 0;
+        }
+    }
+
+    if (eql(tokens[0], "am") and tokens.len >= 3 and eql(tokens[1], "set-standby-bucket")) {
+        if (mutationFails(scenario)) return 1;
+        const state_path = try statePath(alloc, self_path);
+        defer alloc.free(state_path);
+        try rewriteState(alloc, io, state_path, &.{ "bucket", tokens[2] }, tokens[3]);
+        return 0;
+    }
+
+    if (eql(tokens[0], "wm")) {
+        if (tokens.len >= 3) {
+            if (mutationFails(scenario)) return 1;
+            const state_path = try statePath(alloc, self_path);
+            defer alloc.free(state_path);
+            if (eql(tokens[2], "reset")) {
+                try rewriteState(alloc, io, state_path, &.{ "wm", tokens[1] }, null);
+            } else {
+                try rewriteState(alloc, io, state_path, &.{ "wm", tokens[1] }, tokens[2]);
+            }
+        }
+        return 0;
+    }
+
+    if (eql(tokens[0], "sm") and tokens.len >= 2 and eql(tokens[1], "idle-maint")) {
+        if (mutationFails(scenario)) return 1;
+        return 0;
+    }
+    if (eql(tokens[0], "false")) return 1;
+    if (eql(tokens[0], "echo")) {
+        try out.print("{s}\n", .{command["echo ".len..]});
+        return 0;
+    }
+    return 0;
+}
+
+fn tokenize(alloc: std.mem.Allocator, command: []const u8) ![]const []const u8 {
+    var tokens: std.ArrayList([]const u8) = .empty;
+    var index: usize = 0;
+    while (index < command.len) {
+        while (index < command.len and (command[index] == ' ' or command[index] == '\t')) {
+            index += 1;
+        }
+        if (index >= command.len) break;
+
+        var token: std.ArrayList(u8) = .empty;
+        var single = false;
+        var double = false;
+        while (index < command.len) {
+            const char = command[index];
+            if (single) {
+                if (char == '\'') {
+                    single = false;
+                } else {
+                    try token.append(alloc, char);
+                }
+                index += 1;
+            } else if (double) {
+                if (char == '"') {
+                    double = false;
+                } else {
+                    try token.append(alloc, char);
+                }
+                index += 1;
+            } else if (char == '\'') {
+                single = true;
+                index += 1;
+            } else if (char == '"') {
+                double = true;
+                index += 1;
+            } else if (char == ' ' or char == '\t') {
+                break;
+            } else {
+                try token.append(alloc, char);
+                index += 1;
+            }
+        }
+        try tokens.append(alloc, try token.toOwnedSlice(alloc));
+    }
+    return tokens.toOwnedSlice(alloc);
+}
+
+fn printSetting(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    kind: []const u8,
+    scenario: []const u8,
+    namespace: []const u8,
+    key: []const u8,
+    out: *std.Io.Writer,
+) !void {
+    const stored = try getStateValue(alloc, io, state_path, &.{ kind, namespace, key });
+    if (stored) |value| {
+        defer alloc.free(value);
+        try out.print("{s}\n", .{value});
+        return;
+    }
+    const query = try std.mem.join(alloc, " ", &.{ namespace, key });
+    defer alloc.free(query);
+    try out.print("{s}\n", .{settingValue(scenario, query)});
+}
+
+fn statePath(alloc: std.mem.Allocator, self_path: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(self_path) orelse ".";
+    return std.fs.path.join(alloc, &.{ dir, ".fake_adb_state" });
+}
+
+fn scriptPath(alloc: std.mem.Allocator, self_path: []const u8, remote: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(self_path) orelse ".";
+    return std.fs.path.join(alloc, &.{ dir, std.fs.path.basename(remote) });
+}
+
+fn storeScript(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    self_path: []const u8,
+    local: []const u8,
+    remote: []const u8,
+) !void {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, local, alloc, .limited(max_state_bytes));
+    defer alloc.free(data);
+    const path = try scriptPath(alloc, self_path, remote);
+    defer alloc.free(path);
+    try writeAbsolute(io, path, data);
+}
+
+fn mutationFails(scenario: []const u8) bool {
+    return eql(scenario, "apply_broken");
+}
+
+fn writeAbsolute(io: std.Io, path: []const u8, data: []const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, data);
+}
+
+fn joinKey(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (parts, 0..) |part, index| {
+        if (index != 0) try out.append(alloc, '\t');
+        try out.appendSlice(alloc, part);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn getStateValue(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    parts: []const []const u8,
+) !?[]u8 {
+    const text = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        state_path,
+        alloc,
+        .limited(max_state_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(text);
+
+    const key = try joinKey(alloc, parts);
+    defer alloc.free(key);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.lastIndexOfScalar(u8, line, '\t') orelse continue;
+        if (!eql(line[0..tab], key)) continue;
+        return try alloc.dupe(u8, line[tab + 1 ..]);
+    }
+    return null;
+}
+
+fn rewriteState(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    state_path: []const u8,
+    parts: []const []const u8,
+    value: ?[]const u8,
+) !void {
+    const existing = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        state_path,
+        alloc,
+        .limited(max_state_bytes),
+    ) catch |err| switch (err) {
+        error.FileNotFound => try alloc.dupe(u8, ""),
+        else => return err,
+    };
+    defer alloc.free(existing);
+
+    const key = try joinKey(alloc, parts);
+    defer alloc.free(key);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var found = false;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.lastIndexOfScalar(u8, line, '\t') orelse {
+            try out.appendSlice(alloc, line);
+            try out.append(alloc, '\n');
+            continue;
+        };
+        if (!eql(line[0..tab], key)) {
+            try out.appendSlice(alloc, line);
+            try out.append(alloc, '\n');
+            continue;
+        }
+        found = true;
+        if (value) |text| {
+            try out.appendSlice(alloc, key);
+            try out.append(alloc, '\t');
+            try out.appendSlice(alloc, text);
+            try out.append(alloc, '\n');
+        }
+    }
+    if (!found) {
+        if (value) |text| {
+            try out.appendSlice(alloc, key);
+            try out.append(alloc, '\t');
+            try out.appendSlice(alloc, text);
+            try out.append(alloc, '\n');
+        }
+    }
+    try writeAbsolute(io, state_path, out.items);
 }
 
 fn getpropFor(scenario: []const u8) []const u8 {
@@ -260,6 +667,9 @@ fn meminfoFor(scenario: []const u8) []const u8 {
     if (std.mem.eql(u8, scenario, "scan_partial")) return meminfo_light;
     if (std.mem.eql(u8, scenario, "scan_no_ram")) return meminfo_partial;
     if (std.mem.eql(u8, scenario, "plan_balanced")) return meminfo_plan_balanced;
+    if (std.mem.eql(u8, scenario, "apply_fail")) return meminfo_light;
+    if (std.mem.eql(u8, scenario, "apply_broken")) return meminfo_light;
+    if (std.mem.eql(u8, scenario, "apply_liar")) return meminfo_light;
     return meminfo_default;
 }
 

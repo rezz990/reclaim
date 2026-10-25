@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const adb = @import("adb.zig");
+const apply = @import("apply.zig");
 const device = @import("device.zig");
 const doctor = @import("doctor.zig");
 const plan = @import("plan.zig");
@@ -399,6 +400,203 @@ const PlanSummaryJson = struct {
     apply: usize,
     skip: usize,
     blocked: usize,
+};
+
+pub fn printApply(writer: *Writer, outcome: apply.Outcome) Writer.Error!void {
+    try printOutcome(writer, outcome);
+}
+
+pub fn printRevert(writer: *Writer, outcome: apply.Outcome) Writer.Error!void {
+    try printOutcome(writer, outcome);
+}
+
+fn printOutcome(writer: *Writer, outcome: apply.Outcome) Writer.Error!void {
+    try writer.print("mode: {s}\n", .{outcome.mode.label()});
+    try writer.print("profile: {s}\n", .{outcome.profile});
+    try writer.print("device: {s}\n", .{outcome.device});
+    if (outcome.sdk) |sdk| {
+        try writer.print("android: SDK {d}\n", .{sdk});
+    } else {
+        try writer.writeAll("android: unknown\n");
+    }
+    if (outcome.ram_total_mb) |ram| {
+        try writer.print("ram: {d} MB\n", .{ram});
+    } else {
+        try writer.writeAll("ram: unknown\n");
+    }
+    if (outcome.created) |created| {
+        try writer.print("created: {s}\n", .{created});
+    }
+    if (outcome.snapshot_path) |path| {
+        try writer.print("snapshot: {s}\n", .{path});
+    } else if (outcome.dry_run) {
+        try writer.writeAll("snapshot: (dry run, nothing written)\n");
+    }
+    if (outcome.log_path) |path| try writer.print("log: {s}\n", .{path});
+    try writer.print("dry run: {s}\n\n", .{if (outcome.dry_run) "yes" else "no"});
+
+    try writer.print(
+        "steps: {d} (planned {d}, applied {d}, reverted {d}, unchanged {d}, skipped {d}, failed {d})\n\n",
+        .{
+            outcome.steps.len,
+            outcome.count(.planned),
+            outcome.count(.applied),
+            outcome.count(.reverted),
+            outcome.count(.unchanged),
+            outcome.count(.skipped),
+            outcome.count(.failed),
+        },
+    );
+
+    for (outcome.steps) |step| {
+        try writer.print("  {s:<9} {s:<16} {s}", .{
+            step.status.label(),
+            step.id,
+            step.target,
+        });
+        if (step.kind == .maintenance) {
+            try writer.writeAll("  run idle maintenance");
+        } else {
+            try writer.print("  {s} -> {s}", .{
+                valueText(step, if (outcome.mode == .apply) step.before else step.after),
+                valueText(step, if (outcome.mode == .apply) step.after else step.before),
+            });
+        }
+        if (step.risk) |risk| try writer.print("  [{s}]", .{risk.label()});
+        if (step.verified) |verified| {
+            if (verified) try writer.writeAll("  verified");
+        }
+        if (step.reason) |reason| try writer.print("  ({s})", .{reason});
+        try writer.writeAll("\n");
+    }
+
+    if (outcome.dry_run) {
+        try writer.print(
+            "\ndry run: nothing was written or changed; pass --yes to {s}.\n",
+            .{switch (outcome.mode) {
+                .apply => "apply the plan",
+                .revert => "restore the snapshot",
+            }},
+        );
+        return;
+    }
+
+    if (outcome.aborted) {
+        try writer.writeAll("\nmore than half of the steps failed; check the device state.\n");
+    }
+    if (outcome.mode == .apply) {
+        if (outcome.snapshot_path) |path| {
+            try writer.print("\nto undo: reclaim revert --snapshot \"{s}\" --yes\n", .{path});
+        }
+    }
+}
+
+fn valueText(step: apply.Step, value: ?[]const u8) []const u8 {
+    if (value) |text| return text;
+    return switch (step.kind) {
+        .compile, .maintenance, .package => "(not tracked)",
+        else => "(unset)",
+    };
+}
+
+pub fn printApplyJson(
+    alloc: Allocator,
+    writer: *Writer,
+    outcome: apply.Outcome,
+) (Allocator.Error || Writer.Error)!void {
+    try printOutcomeJson(alloc, writer, outcome);
+}
+
+pub fn printRevertJson(
+    alloc: Allocator,
+    writer: *Writer,
+    outcome: apply.Outcome,
+) (Allocator.Error || Writer.Error)!void {
+    try printOutcomeJson(alloc, writer, outcome);
+}
+
+fn printOutcomeJson(
+    alloc: Allocator,
+    writer: *Writer,
+    outcome: apply.Outcome,
+) (Allocator.Error || Writer.Error)!void {
+    const steps = try alloc.alloc(OutcomeStepJson, outcome.steps.len);
+    defer alloc.free(steps);
+    for (outcome.steps, 0..) |step, index| {
+        steps[index] = .{
+            .id = step.id,
+            .kind = step.kind.label(),
+            .risk = if (step.risk) |risk| risk.label() else null,
+            .target = step.target,
+            .before = step.before,
+            .after = step.after,
+            .status = step.status.label(),
+            .verified = step.verified,
+            .exit_code = step.exit_code,
+            .reason = step.reason,
+        };
+    }
+
+    const view: OutcomeJson = .{
+        .mode = outcome.mode.label(),
+        .profile = outcome.profile,
+        .device = outcome.device,
+        .sdk = outcome.sdk,
+        .ram_total_mb = outcome.ram_total_mb,
+        .created = outcome.created,
+        .dry_run = outcome.dry_run,
+        .snapshot_path = outcome.snapshot_path,
+        .log_path = outcome.log_path,
+        .aborted = outcome.aborted,
+        .steps = steps,
+        .summary = .{
+            .planned = outcome.count(.planned),
+            .applied = outcome.count(.applied),
+            .reverted = outcome.count(.reverted),
+            .unchanged = outcome.count(.unchanged),
+            .skipped = outcome.count(.skipped),
+            .failed = outcome.count(.failed),
+        },
+    };
+    try std.json.Stringify.value(view, .{}, writer);
+    try writer.writeAll("\n");
+}
+
+const OutcomeJson = struct {
+    mode: []const u8,
+    profile: []const u8,
+    device: []const u8,
+    sdk: ?u32 = null,
+    ram_total_mb: ?u64 = null,
+    created: ?[]const u8 = null,
+    dry_run: bool,
+    snapshot_path: ?[]const u8 = null,
+    log_path: ?[]const u8 = null,
+    aborted: bool,
+    steps: []const OutcomeStepJson,
+    summary: OutcomeSummaryJson,
+};
+
+const OutcomeStepJson = struct {
+    id: []const u8,
+    kind: []const u8,
+    risk: ?[]const u8 = null,
+    target: []const u8,
+    before: ?[]const u8 = null,
+    after: ?[]const u8 = null,
+    status: []const u8,
+    verified: ?bool = null,
+    exit_code: ?u8 = null,
+    reason: ?[]const u8 = null,
+};
+
+const OutcomeSummaryJson = struct {
+    planned: usize,
+    applied: usize,
+    reverted: usize,
+    unchanged: usize,
+    skipped: usize,
+    failed: usize,
 };
 
 const Render = struct {
@@ -844,6 +1042,270 @@ test "printError prefixes the message" {
     defer render.deinit();
     try printError(render.writer(), "could not list devices");
     try std.testing.expectEqualStrings("reclaim: could not list devices\n", render.output());
+}
+
+test "apply report shows a dry run without writing a snapshot" {
+    var steps = [_]apply.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .before = "1.0",
+            .after = "0.5",
+            .status = .planned,
+        },
+        .{
+            .id = "anim-transition",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/transition_animation_scale",
+            .before = "1.0",
+            .after = "1.0",
+            .status = .unchanged,
+        },
+        .{
+            .id = "dexopt",
+            .kind = .compile,
+            .risk = .safe,
+            .target = "compile speed-profile (all)",
+            .after = "speed-profile",
+            .status = .skipped,
+            .reason = "requires SDK >= 30 (device is 29)",
+        },
+    };
+    const outcome: apply.Outcome = .{
+        .mode = .apply,
+        .profile = "light",
+        .device = "FAKE123",
+        .sdk = 29,
+        .ram_total_mb = 2947,
+        .dry_run = true,
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printApply(render.writer(), outcome);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "mode: apply\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "snapshot: (dry run, nothing written)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "dry run: yes\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "steps: 3 (planned 1, applied 0, reverted 0, unchanged 1, skipped 1, failed 0)\n") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "  planned   anim-window      global/window_animation_scale  1.0 -> 0.5  [safe]\n") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "compile speed-profile (all)  (not tracked) -> speed-profile") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "pass --yes to apply the plan.\n") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "to undo:") == null);
+}
+
+test "apply report lists applied and failed steps with the undo hint" {
+    var steps = [_]apply.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .before = "1.0",
+            .after = "0.5",
+            .status = .applied,
+            .verified = true,
+        },
+        .{
+            .id = "dexopt",
+            .kind = .compile,
+            .risk = .safe,
+            .target = "compile speed-profile (all)",
+            .after = "speed-profile",
+            .status = .failed,
+            .verified = false,
+            .exit_code = 1,
+            .reason = "the command exited with code 1",
+        },
+    };
+    const outcome: apply.Outcome = .{
+        .mode = .apply,
+        .profile = "light",
+        .device = "FAKE123",
+        .sdk = 29,
+        .ram_total_mb = 2947,
+        .created = "2026-10-25T10:00:00Z",
+        .dry_run = false,
+        .snapshot_path = "/snapshots/FAKE123_20261025T100000.json",
+        .log_path = "/logs/apply_FAKE123_20261025T100000.log",
+        .aborted = true,
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printApply(render.writer(), outcome);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "created: 2026-10-25T10:00:00Z\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "snapshot: /snapshots/FAKE123_20261025T100000.json\n") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "log: /logs/apply_FAKE123_20261025T100000.log\n") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "dry run: no\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "applied   anim-window      global/window_animation_scale  1.0 -> 0.5  [safe]  verified") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "failed    dexopt           compile speed-profile (all)  (not tracked) -> speed-profile  [safe]  (the command exited with code 1)") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "more than half of the steps failed") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "to undo: reclaim revert --snapshot \"/snapshots/FAKE123_20261025T100000.json\" --yes\n") != null,
+    );
+}
+
+test "revert report reverses the direction and names the snapshot" {
+    var steps = [_]apply.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .target = "global/window_animation_scale",
+            .before = "1.0",
+            .after = "0.5",
+            .status = .reverted,
+            .verified = true,
+        },
+        .{
+            .id = "anim-transition",
+            .kind = .setting,
+            .target = "global/transition_animation_scale",
+            .before = null,
+            .after = "0.5",
+            .status = .planned,
+        },
+    };
+    const outcome: apply.Outcome = .{
+        .mode = .revert,
+        .profile = "light",
+        .device = "FAKE123",
+        .created = "2026-10-25T10:00:00Z",
+        .dry_run = true,
+        .snapshot_path = "/snapshots/snap.json",
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printRevert(render.writer(), outcome);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "mode: revert\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "0.5 -> 1.0") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "0.5 -> (unset)") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "pass --yes to restore the snapshot.\n") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "to undo:") == null);
+}
+
+test "apply JSON is machine readable" {
+    var steps = [_]apply.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .risk = .safe,
+            .target = "global/window_animation_scale",
+            .before = "1.0",
+            .after = "0.5",
+            .status = .applied,
+            .verified = true,
+            .exit_code = 0,
+        },
+        .{
+            .id = "dexopt",
+            .kind = .compile,
+            .risk = .safe,
+            .target = "compile speed-profile (all)",
+            .after = "speed-profile",
+            .status = .failed,
+            .verified = false,
+            .exit_code = 1,
+            .reason = "the command exited with code 1",
+        },
+    };
+    const outcome: apply.Outcome = .{
+        .mode = .apply,
+        .profile = "light",
+        .device = "FAKE123",
+        .sdk = 29,
+        .ram_total_mb = 2947,
+        .created = "2026-10-25T10:00:00Z",
+        .dry_run = false,
+        .snapshot_path = "/snapshots/snap.json",
+        .log_path = "/logs/apply.log",
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printApplyJson(std.testing.allocator, render.writer(), outcome);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"mode\":\"apply\",\"profile\":\"light\",\"device\":\"FAKE123\""));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"dry_run\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"snapshot_path\":\"/snapshots/snap.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"verified\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"exit_code\":1") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"summary\":{\"planned\":0,\"applied\":1,\"reverted\":0,\"unchanged\":0,\"skipped\":0,\"failed\":1}") != null,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+}
+
+test "revert JSON is machine readable" {
+    var steps = [_]apply.Step{
+        .{
+            .id = "anim-window",
+            .kind = .setting,
+            .target = "global/window_animation_scale",
+            .before = "1.0",
+            .after = "0.5",
+            .status = .reverted,
+            .verified = true,
+        },
+    };
+    const outcome: apply.Outcome = .{
+        .mode = .revert,
+        .profile = "light",
+        .device = "FAKE123",
+        .created = "2026-10-25T10:00:00Z",
+        .dry_run = true,
+        .snapshot_path = "/snapshots/snap.json",
+        .steps = &steps,
+    };
+
+    var render: Render = .init();
+    defer render.deinit();
+    try printRevertJson(std.testing.allocator, render.writer(), outcome);
+    const text = render.output();
+
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"mode\":\"revert\""));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"status\":\"reverted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"risk\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"log_path\":null") != null);
 }
 
 test "usage errors explain the failure" {

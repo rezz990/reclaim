@@ -9,6 +9,8 @@ const denylist = @import("denylist.zig");
 const device = @import("device.zig");
 const doctor = @import("doctor.zig");
 const main = @import("main.zig");
+const paths = @import("paths.zig");
+const snapshot = @import("snapshot.zig");
 
 const io = std.testing.io;
 const alloc = std.testing.allocator;
@@ -242,14 +244,17 @@ test "runScript parses step markers and removes its temp file" {
     var scratch = std.testing.tmpDir(.{ .iterate = true });
     defer scratch.cleanup();
 
-    const lines = try adb.runScript(alloc, fake.handle(), "FAKE123", "echo step\n", scratch.dir);
+    const script =
+        "echo \"__STEP=anim-window __RC=$?\"\n" ++
+        "echo \"__STEP=dexopt __RC=$?\"\n";
+    const lines = try adb.runScript(alloc, fake.handle(), "FAKE123", script, scratch.dir);
     defer adb.freeScriptLines(alloc, lines);
 
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqualStrings("anim-window", lines[0].step_id);
     try std.testing.expectEqual(@as(u8, 0), lines[0].exit_code);
     try std.testing.expectEqualStrings("dexopt", lines[1].step_id);
-    try std.testing.expectEqual(@as(u8, 1), lines[1].exit_code);
+    try std.testing.expectEqual(@as(u8, 0), lines[1].exit_code);
 
     var iterator = scratch.dir.iterate();
     try std.testing.expect((try iterator.next(io)) == null);
@@ -367,15 +372,17 @@ const CommandOutput = struct {
     }
 };
 
-fn runWithFake(fake: *const Fake, args: []const []const u8) !CommandOutput {
+fn runWithEnv(
+    fake: *const Fake,
+    env: *const std.process.Environ.Map,
+    args: []const []const u8,
+) !CommandOutput {
     const full = try alloc.alloc([]const u8, args.len + 2);
     defer alloc.free(full);
     @memcpy(full[0..args.len], args);
     full[args.len] = "--adb";
     full[args.len + 1] = fake.path;
 
-    var env = emptyEnv();
-    defer env.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -383,11 +390,86 @@ fn runWithFake(fake: *const Fake, args: []const []const u8) !CommandOutput {
     var err_writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer err_writer.deinit();
 
-    const code = try main.run(arena.allocator(), io, &env, full, &out.writer, &err_writer.writer);
+    const code = try main.run(arena.allocator(), io, env, full, &out.writer, &err_writer.writer);
     const stdout = try out.toOwnedSlice();
     errdefer alloc.free(stdout);
     const stderr = try err_writer.toOwnedSlice();
     return .{ .code = code, .stdout = stdout, .stderr = stderr };
+}
+
+fn runWithFake(fake: *const Fake, args: []const []const u8) !CommandOutput {
+    var env = emptyEnv();
+    defer env.deinit();
+    return runWithEnv(fake, &env, args);
+}
+
+const TestEnv = struct {
+    map: std.process.Environ.Map,
+    appdata: []u8,
+    snapshot_dir: []u8,
+    log_dir: []u8,
+
+    fn init(fake: *const Fake) !TestEnv {
+        var map = std.process.Environ.Map.init(alloc);
+        errdefer map.deinit();
+
+        const appdata = try std.fs.path.join(alloc, &.{ fake.dir_path, "appdata" });
+        errdefer alloc.free(appdata);
+        try std.Io.Dir.cwd().createDirPath(io, appdata);
+
+        try map.put("APPDATA", appdata);
+        try map.put("XDG_CONFIG_HOME", appdata);
+        try map.put("HOME", appdata);
+
+        const snapshot_dir = try paths.snapshotDir(alloc, &map);
+        errdefer alloc.free(snapshot_dir);
+        const log_dir = try paths.logDir(alloc, &map);
+        return .{
+            .map = map,
+            .appdata = appdata,
+            .snapshot_dir = snapshot_dir,
+            .log_dir = log_dir,
+        };
+    }
+
+    fn deinit(env: *TestEnv) void {
+        alloc.free(env.log_dir);
+        alloc.free(env.snapshot_dir);
+        alloc.free(env.appdata);
+        env.map.deinit();
+    }
+
+    fn pointAt(env: *TestEnv, path: []const u8) !void {
+        try env.map.put("APPDATA", path);
+        try env.map.put("XDG_CONFIG_HOME", path);
+        try env.map.put("HOME", path);
+    }
+
+    fn snapshotCount(env: *const TestEnv) !usize {
+        return entryCount(env.snapshot_dir);
+    }
+
+    fn logCount(env: *const TestEnv) !usize {
+        return entryCount(env.log_dir);
+    }
+};
+
+fn entryCount(dir_path: []const u8) !usize {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var count: usize = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
+fn exists(path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
 }
 
 test "probe reads the fingerprint from the fake adb" {
@@ -732,6 +814,290 @@ test "plan refuses multiple devices without a serial" {
 
     try std.testing.expectEqual(@as(u8, 4), output.code);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr, "multiple devices connected") != null);
+}
+
+test "apply without --yes is a dry run and writes nothing" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const output = try runWithEnv(&fake, &env.map, &.{ "apply", "light" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    try std.testing.expectEqualStrings("", output.stderr);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "mode: apply\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "dry run: yes\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "snapshot: (dry run, nothing written)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pass --yes to apply the plan") != null);
+    try std.testing.expectEqual(@as(usize, 0), try env.snapshotCount());
+    try std.testing.expectEqual(@as(usize, 0), try env.logCount());
+
+    const state_file = try std.fs.path.join(alloc, &.{ fake.dir_path, ".fake_adb_state" });
+    defer alloc.free(state_file);
+    try std.testing.expect(!exists(state_file));
+}
+
+test "apply dry run can emit JSON" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const output = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--json" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), output.code);
+    const text = output.stdout;
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"mode\":\"apply\",\"profile\":\"light\",\"device\":\"FAKE123\""));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"snapshot_path\":null") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text, "\"summary\":{\"planned\":4,\"applied\":0,\"reverted\":0,\"unchanged\":1,\"skipped\":0,\"failed\":0}") != null,
+    );
+}
+
+test "apply then revert restores the same plan" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const baseline = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer baseline.deinit();
+    try std.testing.expectEqual(@as(u8, 0), baseline.code);
+
+    const applied = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes" });
+    defer applied.deinit();
+    try std.testing.expectEqual(@as(u8, 0), applied.code);
+    try std.testing.expectEqualStrings("", applied.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, applied.stdout, "snapshot: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, applied.stdout, "log: ") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, applied.stdout, "to undo: reclaim revert --snapshot") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            applied.stdout,
+            "steps: 5 (planned 0, applied 4, reverted 0, unchanged 1, skipped 0, failed 0)",
+        ) != null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), try env.snapshotCount());
+    try std.testing.expectEqual(@as(usize, 1), try env.logCount());
+
+    const changed = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(u8, 0), changed.code);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        changed.stdout,
+        "\"target\":\"global/window_animation_scale\",\"current\":{\"state\":\"value\",\"value\":\"0.5\"},\"desired\":\"0.5\",\"status\":\"apply\",\"changed\":false",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        changed.stdout,
+        "\"target\":\"global/animator_duration_scale\",\"current\":{\"state\":\"value\",\"value\":\"0.5\"}",
+    ) != null);
+
+    const preview = try runWithEnv(&fake, &env.map, &.{"revert"});
+    defer preview.deinit();
+    try std.testing.expectEqual(@as(u8, 0), preview.code);
+    try std.testing.expect(std.mem.indexOf(u8, preview.stdout, "mode: revert\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.stdout, "dry run: yes\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.stdout, "steps: 3 (planned 3") != null);
+
+    const reverted = try runWithEnv(&fake, &env.map, &.{ "revert", "--yes" });
+    defer reverted.deinit();
+    try std.testing.expectEqual(@as(u8, 0), reverted.code);
+    try std.testing.expectEqualStrings("", reverted.stderr);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            reverted.stdout,
+            "steps: 3 (planned 0, applied 0, reverted 3, unchanged 0, skipped 0, failed 0)",
+        ) != null,
+    );
+
+    const restored = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(u8, 0), restored.code);
+    try std.testing.expectEqualStrings(baseline.stdout, restored.stdout);
+}
+
+test "apply refuses to run when the snapshot cannot be written" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const baseline = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer baseline.deinit();
+
+    const blocker = try std.fs.path.join(alloc, &.{ fake.dir_path, "blocked-appdata" });
+    defer alloc.free(blocker);
+    var file = try std.Io.Dir.createFileAbsolute(io, blocker, .{});
+    file.close(io);
+    try env.pointAt(blocker);
+
+    const output = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes" });
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 1), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "snapshot") != null);
+
+    const after = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer after.deinit();
+    try std.testing.expectEqualStrings(baseline.stdout, after.stdout);
+}
+
+test "apply reports a partial failure and revert still restores the device" {
+    var fake = try Fake.scenario("apply_fail");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const baseline = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer baseline.deinit();
+
+    const applied = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes" });
+    defer applied.deinit();
+    try std.testing.expectEqual(@as(u8, 5), applied.code);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            applied.stdout,
+            "steps: 5 (planned 0, applied 4, reverted 0, unchanged 0, skipped 0, failed 1)",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, applied.stdout, "the command exited with code 1") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, applied.stdout, "more than half of the steps failed") == null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), try env.snapshotCount());
+
+    const reverted = try runWithEnv(&fake, &env.map, &.{ "revert", "--yes" });
+    defer reverted.deinit();
+    try std.testing.expectEqual(@as(u8, 0), reverted.code);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            reverted.stdout,
+            "steps: 4 (planned 0, applied 0, reverted 4, unchanged 0, skipped 0, failed 0)",
+        ) != null,
+    );
+
+    const restored = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(baseline.stdout, restored.stdout);
+}
+
+test "apply verifies changes and reports a mismatch" {
+    var fake = try Fake.scenario("apply_liar");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const baseline = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer baseline.deinit();
+
+    const applied = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes", "--json" });
+    defer applied.deinit();
+
+    try std.testing.expectEqual(@as(u8, 5), applied.code);
+    try std.testing.expect(std.mem.indexOf(u8, applied.stdout, "\"aborted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        applied.stdout,
+        "\"status\":\"failed\",\"verified\":false,\"exit_code\":0,\"reason\":\"verification failed: expected '0.5', found '(unset)'\"",
+    ) != null);
+
+    const after = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer after.deinit();
+    try std.testing.expectEqualStrings(baseline.stdout, after.stdout);
+}
+
+test "apply aborts when more than half of the steps fail" {
+    var fake = try Fake.scenario("apply_broken");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const baseline = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer baseline.deinit();
+
+    const applied = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes", "--json" });
+    defer applied.deinit();
+    try std.testing.expectEqual(@as(u8, 5), applied.code);
+    try std.testing.expect(std.mem.indexOf(u8, applied.stdout, "\"aborted\":true") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, applied.stdout, "\"summary\":{\"planned\":0,\"applied\":0,\"reverted\":0,\"unchanged\":0,\"skipped\":0,\"failed\":5}") != null,
+    );
+
+    const after = try runWithEnv(&fake, &env.map, &.{ "plan", "light", "--json" });
+    defer after.deinit();
+    try std.testing.expectEqualStrings(baseline.stdout, after.stdout);
+}
+
+test "revert without a snapshot exits one" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const output = try runWithEnv(&fake, &env.map, &.{"revert"});
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 1), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "no snapshot found") != null);
+}
+
+test "revert refuses a snapshot taken on another device" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    var entries: [0]snapshot.Entry = .{};
+    const snap: snapshot.Snapshot = .{
+        .created = "2026-10-25T10:00:00Z",
+        .device = .{ .serial = "OTHER", .sdk = 29 },
+        .profile = "light",
+        .entries = &entries,
+    };
+    var diagnostic: snapshot.Diagnostic = .{};
+    defer diagnostic.deinit(alloc);
+    const path = try snapshot.save(alloc, io, env.snapshot_dir, snap, 1_700_000_000, &diagnostic);
+    defer alloc.free(path);
+
+    const output = try runWithEnv(&fake, &env.map, &.{ "revert", "--snapshot", path, "--yes" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 1), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.stderr, "snapshot was taken on device 'OTHER'") != null,
+    );
+}
+
+test "apply rejects unknown step ids" {
+    var fake = try Fake.scenario("scan_light");
+    defer fake.deinit();
+    var env = try TestEnv.init(&fake);
+    defer env.deinit();
+
+    const output = try runWithEnv(&fake, &env.map, &.{ "apply", "light", "--yes", "--only", "nope" });
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), output.code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "unknown step id 'nope'") != null);
+    try std.testing.expectEqual(@as(usize, 0), try env.snapshotCount());
 }
 
 test "denylist reads the default apps from the device" {

@@ -768,7 +768,7 @@ fn optionalU32(
     return @intCast(number);
 }
 
-fn freeTarget(target: *const Target, alloc: Allocator) void {
+pub fn freeTarget(target: *const Target, alloc: Allocator) void {
     switch (target.*) {
         .setting => |value| {
             alloc.free(value.namespace);

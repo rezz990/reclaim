@@ -386,7 +386,7 @@ fn isChanged(current: Current, desired: ?[]const u8) bool {
     return !std.mem.eql(u8, value, wanted);
 }
 
-fn readCurrent(
+pub fn readCurrent(
     alloc: Allocator,
     adb_path: adb.AdbPath,
     serial: []const u8,

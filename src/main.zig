@@ -1,11 +1,14 @@
 const std = @import("std");
 const adb = @import("adb.zig");
+const apply = @import("apply.zig");
 const cli = @import("cli.zig");
 const device = @import("device.zig");
 const doctor = @import("doctor.zig");
+const paths = @import("paths.zig");
 const plan = @import("plan.zig");
 const profile = @import("profile.zig");
 const report = @import("report.zig");
+const snapshot = @import("snapshot.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -57,6 +60,30 @@ pub fn run(
                     env,
                     app.global,
                     request.profile,
+                    out,
+                    err,
+                ),
+                .apply => |request| return runApply(
+                    alloc,
+                    io,
+                    env,
+                    app.global,
+                    request.profile,
+                    .{
+                        .yes = request.yes,
+                        .skip = request.skip,
+                        .only = request.only,
+                    },
+                    out,
+                    err,
+                ),
+                .revert => |request| return runRevert(
+                    alloc,
+                    io,
+                    env,
+                    app.global,
+                    request.snapshot,
+                    request.yes,
                     out,
                     err,
                 ),
@@ -217,6 +244,267 @@ fn runPlan(
     }
 
     return if (built.count(.blocked) > 0) 6 else 0;
+}
+
+const CommandDirs = struct {
+    snapshot: []u8,
+    log: []u8,
+
+    fn deinit(dirs: *CommandDirs, alloc: std.mem.Allocator) void {
+        alloc.free(dirs.snapshot);
+        alloc.free(dirs.log);
+        dirs.* = undefined;
+    }
+};
+
+const DirsResult = union(enum) {
+    ready: CommandDirs,
+    failed: u8,
+};
+
+fn resolveDirs(
+    alloc: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    err: *std.Io.Writer,
+) !DirsResult {
+    const snapshot_dir = paths.snapshotDir(alloc, env) catch |path_err| switch (path_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try report.printError(
+                err,
+                "could not resolve the snapshot directory; set APPDATA (Windows) or HOME",
+            );
+            return .{ .failed = 1 };
+        },
+    };
+    var keep = false;
+    defer if (!keep) alloc.free(snapshot_dir);
+
+    const log_dir = paths.logDir(alloc, env) catch |path_err| switch (path_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try report.printError(
+                err,
+                "could not resolve the log directory; set APPDATA (Windows) or HOME",
+            );
+            return .{ .failed = 1 };
+        },
+    };
+
+    keep = true;
+    return .{ .ready = .{ .snapshot = snapshot_dir, .log = log_dir } };
+}
+
+fn runApply(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    global: cli.GlobalOptions,
+    profile_name: []const u8,
+    options: apply.ApplyOptions,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var profile_diagnostic: profile.Diagnostic = .{};
+    defer profile_diagnostic.deinit(alloc);
+
+    var loaded = profile.load(alloc, io, profile_name, &profile_diagnostic) catch |load_err| switch (load_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try report.printError(
+                err,
+                profile_diagnostic.message orelse "could not load the profile",
+            );
+            return 1;
+        },
+    };
+    defer loaded.deinit(alloc);
+
+    var setup = switch (try openSession(alloc, io, env, global, err)) {
+        .failed => |code| return code,
+        .ready => |ready| ready,
+    };
+    defer setup.deinit(alloc);
+
+    var built = try plan.build(alloc, setup.adb_path, setup.fingerprint, loaded);
+    defer built.deinit(alloc);
+
+    var dirs = switch (try resolveDirs(alloc, env, err)) {
+        .failed => |code| return code,
+        .ready => |ready| ready,
+    };
+    defer dirs.deinit(alloc);
+
+    var diagnostic: apply.Diagnostic = .{};
+    defer diagnostic.deinit(alloc);
+
+    var outcome = apply.apply(
+        alloc,
+        io,
+        setup.adb_path,
+        setup.fingerprint,
+        built,
+        options,
+        .{ .snapshot_dir = dirs.snapshot, .log_dir = dirs.log },
+        &diagnostic,
+    ) catch |failure| switch (failure) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return reportApplyError(err, failure, diagnostic),
+    };
+    defer outcome.deinit(alloc);
+
+    if (global.json) {
+        try report.printApplyJson(alloc, out, outcome);
+    } else {
+        try report.printApply(out, outcome);
+    }
+    return outcomeCode(outcome);
+}
+
+fn runRevert(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    global: cli.GlobalOptions,
+    requested_snapshot: ?[]const u8,
+    yes: bool,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
+    var load_diagnostic: snapshot.Diagnostic = .{};
+    defer load_diagnostic.deinit(alloc);
+
+    var preloaded: ?snapshot.Snapshot = null;
+    defer if (preloaded) |*value| value.deinit(alloc);
+    var preloaded_path: ?[]u8 = null;
+    defer if (preloaded_path) |path| alloc.free(path);
+
+    if (requested_snapshot) |given| {
+        preloaded = snapshot.load(alloc, io, given, &load_diagnostic) catch |load_err| switch (load_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try report.printError(
+                    err,
+                    load_diagnostic.message orelse "could not read the snapshot",
+                );
+                return 1;
+            },
+        };
+        preloaded_path = try alloc.dupe(u8, given);
+    }
+
+    var setup = switch (try openSession(alloc, io, env, global, err)) {
+        .failed => |code| return code,
+        .ready => |ready| ready,
+    };
+    defer setup.deinit(alloc);
+
+    var dirs = switch (try resolveDirs(alloc, env, err)) {
+        .failed => |code| return code,
+        .ready => |ready| ready,
+    };
+    defer dirs.deinit(alloc);
+
+    var snap: snapshot.Snapshot = undefined;
+    var chosen_path: []const u8 = undefined;
+    var latest_path: ?[]u8 = null;
+    defer if (latest_path) |path| alloc.free(path);
+
+    if (preloaded) |value| {
+        snap = value;
+        preloaded = null;
+        chosen_path = preloaded_path.?;
+    } else {
+        const latest = snapshot.latestPath(
+            alloc,
+            io,
+            dirs.snapshot,
+            setup.fingerprint.serial,
+            &load_diagnostic,
+        ) catch |lookup_err| switch (lookup_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try report.printError(
+                    err,
+                    load_diagnostic.message orelse "could not look up the latest snapshot",
+                );
+                return 1;
+            },
+        };
+        const found = latest orelse {
+            try report.printError(
+                err,
+                "no snapshot found for this device; run 'reclaim apply <profile> --yes' first",
+            );
+            return 1;
+        };
+        latest_path = found;
+        chosen_path = found;
+        snap = snapshot.load(alloc, io, found, &load_diagnostic) catch |load_err| switch (load_err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try report.printError(
+                    err,
+                    load_diagnostic.message orelse "could not read the latest snapshot",
+                );
+                return 1;
+            },
+        };
+    }
+    defer snap.deinit(alloc);
+
+    var diagnostic: apply.Diagnostic = .{};
+    defer diagnostic.deinit(alloc);
+
+    var outcome = apply.revert(
+        alloc,
+        io,
+        setup.adb_path,
+        setup.fingerprint,
+        snap,
+        chosen_path,
+        .{ .yes = yes },
+        .{ .snapshot_dir = dirs.snapshot, .log_dir = dirs.log },
+        &diagnostic,
+    ) catch |failure| switch (failure) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return reportApplyError(err, failure, diagnostic),
+    };
+    defer outcome.deinit(alloc);
+
+    if (global.json) {
+        try report.printRevertJson(alloc, out, outcome);
+    } else {
+        try report.printRevert(out, outcome);
+    }
+    return outcomeCode(outcome);
+}
+
+fn reportApplyError(
+    err: *std.Io.Writer,
+    failure: apply.Error,
+    diagnostic: apply.Diagnostic,
+) !u8 {
+    const message = diagnostic.message orelse switch (failure) {
+        error.BlockedByDenylist => "refusing to apply a blocked step",
+        error.UnknownSelection => "unknown step id selected",
+        error.SnapshotMismatch => "the snapshot was taken on a different device",
+        error.InvalidTarget => "a step target is invalid",
+        error.SnapshotWriteFailed => "could not write the snapshot",
+        error.LogFailed => "could not write the log",
+        error.AdbFailed => "could not execute the batch on the device",
+        error.OutOfMemory => "out of memory",
+    };
+    try report.printError(err, message);
+    return switch (failure) {
+        error.BlockedByDenylist => 6,
+        error.UnknownSelection => 2,
+        else => 1,
+    };
+}
+
+fn outcomeCode(outcome: apply.Outcome) u8 {
+    return if (outcome.count(.failed) > 0) 5 else 0;
 }
 
 fn runDoctor(
